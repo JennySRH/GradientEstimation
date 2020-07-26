@@ -57,7 +57,7 @@ class InputDependentBaseline(Module):
         )
 
     def forward(self, x):
-        return self.fnn(x)
+        return self.fnn(2 * x - 1.)
 
 
 class AutoRegressiveInferenceNet(Module):
@@ -91,14 +91,28 @@ class InferenceNet(Module):
 
     def forward(self, x):
         logits = []
-        h = []
-        for module in self._modules.values():
+        samples_z = []
+        for idx, module in enumerate(self._modules.values()):
             logit = module(2 * x - 1.)
             u = torch.rand_like(logit)
             x = (torch.sigmoid(logit) > u).float()
             logits.append(logit)
-            h.append(x)
-        return logits, h
+            samples_z.append(x)
+        return logits, samples_z
+
+    def manual_forward(self, z, starting_layer):
+        logits = []
+        samples_z = []
+        for idx, module in enumerate(self._modules.values()):
+            if idx < starting_layer:
+                continue
+            logit = module(2 * z - 1.)
+            u = torch.rand_like(logit)
+            z = (torch.sigmoid(logit) > u).float()
+            logits.append(logit)
+            samples_z.append(z)
+        return logits, samples_z
+
 
 
 class AutoRegressiveGenerativeNet(Module):
@@ -148,6 +162,9 @@ class MultiOptim(object):
 
 
 def log_bernoulli_prob(logits, input):
+    """
+    output shape : [batch_size]
+    """
     return torch.sum(logits * input, dim=-1) - torch.sum(softplus(logits), dim=-1)
 
 

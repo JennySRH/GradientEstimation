@@ -8,7 +8,7 @@ from utils import GenerativeNet, InferenceNet, InputDependentBaseline, AutoRegre
     log_bernoulli_prob, st_sigmoid
 
 
-class SBN(nn.Module):
+class SigmoidBeliefNetwork(nn.Module):
     def __init__(self,
                  mean_obs,
                  dim_hids=[200],
@@ -20,12 +20,14 @@ class SBN(nn.Module):
                  method='nvil',
                  temp=None,
                  num_samples=None):
-        super(SBN, self).__init__()
+        super(SigmoidBeliefNetwork, self).__init__()
         self.temp = temp
         self.num_layers = len(dim_hids)
         self.num_samples = num_samples
         gen_layers = dim_hids + [dim_obs]
         inf_layers = [dim_obs] + dim_hids[::-1]
+        # z_L -> z_{L-1} -> ... -> z_1 -> x
+        # x -> z_1 -> z_2 -> ... -> z_L
         if use_nonlinear:
             self.top_prior = Bias(gen_layers[0], trainable=use_uniform_prior)
             self.generative_net = NonlinearGenerativeNet(dim_obs, dim_hids[0])
@@ -69,37 +71,34 @@ class SBN(nn.Module):
                     *[nn.Linear(inf_layers[i], inf_layers[i + 1]) for i in range(len(inf_layers) - 1)])
 
         self.register_buffer('mean_obs', mean_obs)
+        self.eval_step = self.compute_elbo
         if method == 'nvil':
             idb_dims = [dim_obs] + dim_hids[::-1][:-1]
             self.alpha = 0.8
             self.idb = nn.ModuleList([InputDependentBaseline(idb_dim, 100) for idb_dim in idb_dims])
             self.register_buffer('tri_1', torch.triu(torch.ones(self.num_layers, self.num_layers + 1)))
             self.register_buffer('tri_2', torch.triu(torch.ones(self.num_layers, self.num_layers)))
-            self.register_buffer('all_ones', torch.ones(self.num_layers))
             self.register_buffer('running_mean', torch.zeros(self.num_layers))
             self.register_buffer('running_var', torch.zeros(self.num_layers))
+            self.register_buffer('all_ones', torch.ones(self.num_layers))
             self.train_step = self.train_nvil
-            self.eval_step = self.eval_single_sample_elbo
         else:
-            self.register_parameter('idb', None)
-            self.register_parameter('all_ones', None)
-            self.register_parameter('tri_2', None)
-            self.register_parameter('tri_1', None)
-            self.register_parameter('running_mean', None)
-            self.register_parameter('running_var', None)
+            # self.register_parameter('idb', None)
+            # self.register_parameter('all_ones', None)
+            # self.register_parameter('tri_2', None)
+            # self.register_parameter('tri_1', None)
+            # self.register_parameter('running_mean', None)
+            # self.register_parameter('running_var', None)
             if method == 'vimco':
                 self.train_step = self.train_vimco
-                self.eval_step = self.eval_multi_sample_elbo
+                self.eval_step = self.compute_multisample_bound
             elif method == 'legrad':
                 print('LeGrad algorithm only supports SBN with single hidden layer')
                 self.train_step = self.train_legrad
-                self.eval_step = self.eval_single_sample_elbo
             elif method == 'arm':
                 self.train_step = self.train_arm
-                self.eval_step = self.eval_single_sample_elbo
             elif method == 'rebar':
                 self.train_step = self.train_rebar
-                self.eval_step = self.eval_single_sample_elbo
             elif method == 'st':
                 self.train_step = self.train_st
                 self.eval_step = self.eval_st
@@ -107,26 +106,50 @@ class SBN(nn.Module):
                 self.train_step = self.train_gumbel
                 self.eval_step = self.eval_gumbel
 
-    def compute_logqh_x_and_logpxh(self, x):
-        log_p = 0.
-        log_q = 0.
-        logit_q, sampled_h = self.inference_net(
-            (x - self.mean_obs + 1.) / 2)  # logit of [h_1 , h_2 , ... , h_n] for posterior
-        logit_p_x_h = self.generative_net(sampled_h[::-1] + [x])  # logit of h_n-1, h_n-2, ..., h_1, x
-        log_ll = log_bernoulli_prob(logit_p_x_h[-1], x)  # log likelihood
-        logit_p = [self.top_prior(sampled_h[-1])] + logit_p_x_h[:-1]  # logit of [h_n , h_n-1 , ...,  h_1] for prior
+    def compute_elbo(self, x, z=None):
+        log_p_x_z, log_q_z, _ = self.compute_forward(x, z)
+        sum_log_p_x_z = torch.sum(torch.stack(log_p_x_z, dim=1), dim=1)
+        sum_log_q_z = torch.sum(torch.stack(log_q_z, dim=1), dim=1)
+        # elbo shape : [batch_size]
+        elbo = sum_log_p_x_z - sum_log_q_z
+        return elbo
+        
+    def compute_forward(self, x, z=None, logits=None):
+        log_p_x_z = []  # [p(z_1 | z_2), p(z_2 | z_3), ..., p(z_L)]
+        log_q_z = []  # [q(z_1 | x), q(z_2 | z_1), q(z_3 | z_2) ..., q(z_L | z_{L-1})]
+
+        # a list of tensors of multiple layers [z_1, z_2, ..., z_L],
+        # each with shape [batch_size, latent_dim_i]
+        # or [batch_size, num_samples, latent_dim_i]
+        # sample z if not given
+        # [z_1, z_2, ..., z_L]
+        # the shape of z is [batch_size, latent_dim_i]
+        # or [batch_size, num_samples, latent_dim_i]
+        if z is None or logits is None:
+            logits_q_z, samples_z = self.inference_net((x - self.mean_obs + 1.) / 2)
+        if z is not None:
+            samples_z = z
+        if logits is not None:
+            logits_q_z = logits
+        # logit of [z_L , z_{L-1} , ...,  z_1, x] for prior
+        logits_p_x_z = [self.top_prior(samples_z[-1])] + self.generative_net(samples_z[::-1] + [x])  
+
         for i in range(self.num_layers):
-            log_p = log_p + log_bernoulli_prob(logit_p[-(i + 1)], sampled_h[i])
-            log_q = log_q + log_bernoulli_prob(logit_q[i], sampled_h[i])
-        return log_p + log_ll, log_q
+            log_p_x_z.append(log_bernoulli_prob(logits_p_x_z[-(i + 2)], samples_z[i]))
+            log_q_z.append(log_bernoulli_prob(logits_q_z[i], samples_z[i]))
+        log_p_x_z.append(log_bernoulli_prob(logits_p_x_z[-1], x))  # log likelihood 
+        return log_p_x_z, log_q_z, (samples_z, logits_p_x_z, logits_q_z)
 
-    def compute_nll(self, x, test_samples=1000):
-        xx = x.unsqueeze(dim=1).repeat(1, test_samples, 1)
-        log_pxh, log_qh_x = self.compute_logqh_x_and_logpxh(xx)
-        estimated_nll = torch.logsumexp(log_pxh - log_qh_x, dim=1) - math.log(test_samples)
-        return estimated_nll.mean().neg().item()
+    def compute_multisample_bound(self, x, num_samples=None):
+        num_samples = self.num_samples if num_samples is None else num_samples
+        xx = x.unsqueeze(dim=1).repeat(1, num_samples, 1)
+        log_p_x_z, log_q_z, _ = self.compute_forward(xx)
+        log_p_x_z = torch.sum(torch.stack(log_p_x_z, dim=2), dim=2)
+        log_q_z = torch.sum(torch.stack(log_q_z, dim=2), dim=2)
+        estimated_nll = torch.logsumexp(log_p_x_z - log_q_z, dim=1) - math.log(num_samples)
+        return estimated_nll
 
-    def _compute_vimco_baseline(self, ls):
+    def _vimco_compute_baseline(self, ls):
         s = torch.sum(ls, dim=1, keepdim=True)
         repeated_ls = ls.unsqueeze(dim=1).repeat(1, self.num_samples, 1)
         prev_baseline = repeated_ls + (1. / (self.num_samples - 1)) * torch.diag_embed(s - self.num_samples * ls)
@@ -135,66 +158,48 @@ class SBN(nn.Module):
 
     def train_vimco(self, x):
         xx = x.unsqueeze(dim=1).repeat(1, self.num_samples, 1)
-        log_pxh, log_qh_x = self.compute_logqh_x_and_logpxh(xx)
-        ls = log_pxh - log_qh_x  # [bs, num_samples]
+        log_p_x_z, log_q_z, _ = self.compute_forward(xx)
+        log_p_x_z = torch.sum(torch.stack(log_p_x_z, dim=2), dim=2)
+        log_q_z = torch.sum(torch.stack(log_q_z, dim=2), dim=2)
+        ls = log_p_x_z - log_q_z  # [bs, num_samples]
         elbo = torch.logsumexp(ls, dim=1, keepdim=True)
-        baselines = self._compute_vimco_baseline(ls)
+        baselines = self._vimco_compute_baseline(ls)
         ws = (ls - elbo).exp().detach()  # [bs, num_samples]
         learning_signal = (elbo - baselines).detach()  # [bs, num_samples]
-        loss_for_theta = (ws * log_pxh).sum(dim=1).mean().neg()
-        loss_for_phi = (learning_signal * log_qh_x - ws * log_qh_x).sum(dim=1).mean().neg()
+        loss_for_theta = (ws * log_p_x_z).sum(dim=1).mean().neg()
+        loss_for_phi = (learning_signal * log_q_z - ws * log_q_z).sum(dim=1).mean().neg()
         total_loss = loss_for_theta + loss_for_phi
         return total_loss, (elbo - math.log(self.num_samples)).mean().neg().item()
 
-    def eval_multi_sample_elbo(self, x):
-        xx = x.unsqueeze(dim=1).repeat(1, self.num_samples, 1)
-        log_pxh, log_qh_x = self.compute_logqh_x_and_logpxh(xx)
-        elbo = torch.logsumexp(log_pxh - log_qh_x, dim=1, keepdim=True) - math.log(self.num_samples)
-        return elbo.mean().neg().item()
-
-    def _compute_nvil_idbs(self, layer_wise_input):
+    def _nvil_compute_idbs(self, layer_wise_input):
         baseline = []
         for i, fnn in enumerate(self.idb):
             baseline.append(fnn(layer_wise_input[i]).squeeze())
         return torch.stack(baseline, dim=1)
 
     def train_nvil(self, x):
-        log_prior = []  # p(h_1 | h_2), p(h_2 | h_3), ..., p(h_n)
-        log_posterior = []  # q(h_1 | x), q(h_2 | h_1), q(h_3 | h_2) ..., q(h_n | h_n-1)
-        logit_q, sampled_h = self.inference_net((x - self.mean_obs + 1.) / 2)
-        # logit of [h_1 , h_2 , ... , h_n] for posterior
-        logit_p_x_h = self.generative_net(sampled_h[::-1] + [x])  # logit of h_n-1, h_n-2, ..., h_1, x
-        log_ll = log_bernoulli_prob(logit_p_x_h[-1], x)  # log likelihood
-        logit_p = [self.top_prior(sampled_h[-1])] + logit_p_x_h[:-1]  # logit of [h_n , h_n-1 , ...,  h_1] for prior
+        log_p_x_z, log_q_z, (samples_z, _, __) = self.compute_forward(x)
+        log_p_x_z, log_q_z = torch.stack(log_p_x_z, dim=1), torch.stack(log_q_z, dim=1)
+        idb_inputs = [(x - self.mean_obs + 1.) / 2] + samples_z
+        idbs = self._nvil_compute_idbs(idb_inputs)
 
-        inputs = [x - self.mean_obs] + sampled_h
-        idbs = self._compute_nvil_idbs(inputs)
-
-        for i in range(self.num_layers):
-            log_prior.append(log_bernoulli_prob(logit_p[-(i + 1)], sampled_h[i]))
-            log_posterior.append(log_bernoulli_prob(logit_q[i], sampled_h[i]))
-        log_pxh, log_qh_x = torch.stack([log_ll] + log_prior, dim=1), torch.stack(log_posterior, dim=1)
-
-        ls_per_layer = (torch.matmul(self.tri_1, log_pxh.unsqueeze(2)) -
-                        torch.matmul(self.tri_2, log_qh_x.unsqueeze(2))).squeeze(dim=2)
-        ls_sub_idb = ls_per_layer - idbs
         with torch.no_grad():
-            elbo = log_pxh.sum(dim=1) - log_qh_x.sum(dim=1)
+            ls_per_layer = (torch.matmul(self.tri_1, log_p_x_z.unsqueeze(2)) -
+                torch.matmul(self.tri_2, log_q_z.unsqueeze(2))).squeeze(dim=2)
+            ls_sub_idb = ls_per_layer - idbs
+            elbo = log_p_x_z.sum(dim=1) - log_q_z.sum(dim=1)
             # assign less weight on the first batch
             self.running_mean = self.alpha * self.running_mean + (1 - self.alpha) * torch.mean(ls_sub_idb, dim=0,
                                                                                                keepdim=True)
             self.running_var = self.alpha * self.running_var + (1 - self.alpha) * torch.var(ls_sub_idb, dim=0,
                                                                                             keepdim=True)
             learning_signal = (ls_sub_idb - self.running_mean) / torch.max(self.all_ones, self.running_var.sqrt())
-        loss_for_theta = log_pxh.sum(dim=1).mean().neg()
-        loss_for_phi = (learning_signal * log_qh_x).sum(dim=1).mean().neg()
+        
+        loss_for_theta = log_p_x_z.sum(dim=1).mean().neg()
+        loss_for_phi = (learning_signal * log_q_z).sum(dim=1).mean().neg()
         loss_for_psi = (learning_signal * idbs).sum(dim=1).mean().neg()
         total_loss = loss_for_theta + loss_for_phi + loss_for_psi
         return total_loss, elbo.mean().neg().item()
-
-    def eval_single_sample_elbo(self, x):
-        log_pxh, log_qh_x = self.compute_logqh_x_and_logpxh(x)
-        return (log_pxh - log_qh_x).mean().neg().item()
 
     def _compute_flipped_f(self, x, logit_q, sampled_h):
         p_xh_0 = []
@@ -238,32 +243,39 @@ class SBN(nn.Module):
                                     dim=-1).mean().neg()
         return total_loss, elbo
 
-    def _compute_fxh(self, x, h, logit_q):
-        logit_pxh = self.generative_net([h, x])  # logit of h_n-1, h_n-2, ..., h_1, x
-        logit_ph = [self.top_prior(h)] + logit_pxh[:-1]
-        log_px_h = log_bernoulli_prob(logit_pxh[-1], x)
-        log_qh_x = log_bernoulli_prob(logit_q, h)
-        log_ph = log_bernoulli_prob(logit_ph[-1], h)
-        return log_px_h + log_ph - log_qh_x
+    def _arm_mutate_layers(self, x, z, layer, samples_z, logits_q_z):
+        # pass the binary vector at layer t 
+        # and return all logits and samples at i-th layer, for all i > t.
+        logits_q_gt_t, samples_z_gt_t = self.inference_net.manual_forward(z, layer + 1)
 
+        # re-combine all logits and samples 1-{t-1}, t, {t+1}-T
+        samples_z = samples_z[0:layer] + [z] + samples_z_gt_t
+        logits_q = logits_q_z[0:layer + 1] + logits_q_gt_t
+
+        # compute elbo
+        log_p_x_z, log_q_z, _ = self.compute_forward(x, samples_z, logits_q)
+        elbo = torch.sum(torch.stack(log_p_x_z, dim=1), dim=1) - torch.sum(torch.stack(log_q_z, dim=1), dim=1)
+        return elbo.unsqueeze(1)
+        
     def train_arm(self, x):
-        logit_q, sampled_h = self.inference_net((x - self.mean_obs + 1.) / 2)
-        # logit of [h_1 , h_2 , ... , h_n] for posterior
-        logit_pxh = self.generative_net(sampled_h[::-1] + [x])  # logit of h_n-1, h_n-2, ..., h_1, x
-        logit_p = [self.top_prior(sampled_h[-1])] + logit_pxh[:-1]
-        log_px_h = log_bernoulli_prob(logit_pxh[-1], x)
-        log_ph = log_bernoulli_prob(logit_p[-1], sampled_h[0])
-        log_qh_x = log_bernoulli_prob(logit_q[0], sampled_h[0])
+        # list with order [z_1, z_2, ..., z_L]
+        log_p_x_z, log_q_z, (samples_z, logits_p_x_z, logits_q_z) = self.compute_forward(x)
+        log_p_x_z = torch.sum(torch.stack(log_p_x_z, dim=1),dim=1)
+        log_q_z = torch.sum(torch.stack(log_q_z, dim=1),dim=1)
+        loss_for_theta = 0.0
         with torch.no_grad():
-            elbo = (log_ph + log_px_h - log_qh_x).mean().neg().item()
-            u = torch.rand_like(logit_q[0])
-            prob = torch.sigmoid(logit_q[0])
-            z_1 = (u > (1. - prob)).float()
-            z_2 = (u < prob).float()
-            f_1 = self._compute_fxh(x, z_1, logit_q[0]).unsqueeze(dim=1)
-            f_2 = self._compute_fxh(x, z_2, logit_q[0]).unsqueeze(dim=1)
-        loss_for_theta = torch.sum((f_1 - f_2) * (u - 0.5) * logit_q[0], dim=-1)
-        total_loss = (log_ph + log_px_h + loss_for_theta).mean().neg()
+            elbo = (log_p_x_z - log_q_z).mean().neg().item()
+        for layer in range(self.num_layers):
+            with torch.no_grad():
+                u = torch.rand_like(logits_q_z[layer])
+                prob = torch.sigmoid(logits_q_z[layer])
+                z_1 = (u > (1. - prob)).float()
+                z_2 = (u < prob).float()
+                f_1 = self._arm_mutate_layers(x, z_1, layer, samples_z, logits_q_z)
+                f_2 = self._arm_mutate_layers(x, z_2, layer, samples_z, logits_q_z)
+            loss_for_theta += torch.sum((f_1 - f_2) * (u - 0.5) * logits_q_z[layer], dim=-1)
+        
+        total_loss = (log_p_x_z + loss_for_theta).mean().neg()
         return total_loss, elbo
 
     def _reparam_z_z_tilde(self, logit, eps=1e-6):

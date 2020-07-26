@@ -1,15 +1,15 @@
 import torch
 import argparse
 import load_dataset
-from sbn import SBN
+from sbn import SigmoidBeliefNetwork
 from torch.optim import Adam
 from load_dataset import load_dataset
 from utils import MultiOptim
 import numpy as np
 
 parser = argparse.ArgumentParser(description='Arguments')
-parser.add_argument('--batch_size', type=int, default=24)
-parser.add_argument('--test_batch_size', type=int, default=50)
+parser.add_argument('--batch_size', type=int, default=50)
+parser.add_argument('--test_batch_size', type=int, default=512)
 parser.add_argument('-e', '--epochs', type=int, default=1000)
 parser.add_argument('--temperature', type=float, default=0.5)
 parser.add_argument('--gen_lr', type=float, default=1e-4)
@@ -61,7 +61,7 @@ def eval_sbn(test_loader, model, args):
             if args.cuda:
                 data = data.cuda()
             elbo = model.eval_step(data)
-            eval_elbo += elbo
+            eval_elbo += elbo.mean().neg().item()
     eval_elbo /= len(test_loader)
     return eval_elbo
 
@@ -75,7 +75,7 @@ def calc_nll(test_loader, model, args):
             for batch_idx, (data, _) in enumerate(test_loader):
                 if args.cuda:
                     data = data.cuda()
-                log_ll = model.compute_nll(data, num_samples)
+                log_ll = model.compute_multisample_bound(data, num_samples).mean().neg().item()
                 test_ll += log_ll
         test_ll /= len(test_loader)
         return test_ll
@@ -85,7 +85,7 @@ def run():
     train_loader, val_loader, test_loader, mean_obs = load_dataset(args)
     train_elbos = []
     eval_elbos = []
-    model = SBN(mean_obs,
+    model = SigmoidBeliefNetwork(mean_obs,
                 dim_hids=args.dims,
                 use_nonlinear=args.use_nonlinear,
                 use_ar_gen=args.use_argen,
