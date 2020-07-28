@@ -16,6 +16,12 @@ class Binarize(object):
         x = (x > u).type(torch.float32)
         return x
 
+class Flatten(object):
+    def __init__(self):
+        pass
+
+    def __call__(self, x):
+        return torch.reshape(x, (x.shape[0], -1)).squeeze()
 
 # lots of codes adapted from
 # https://github.com/jmtomczak/vae_vampprior/blob/master/utils/load_data.py
@@ -52,19 +58,25 @@ def load_static_mnist(bs, test_bs, **kwargs):
 def load_dynamic_mnist(bs, test_bs, **kwargs):
     train_set = datasets.MNIST('datasets/dynamic_mnist', train=True, download=True, transform=transforms.Compose([
         transforms.ToTensor(),
-        Binarize()
+        Binarize(),
+        Flatten()
     ]))
     train_sampler = SubsetRandomSampler(list(range(0, 50000)))
     val_sampler = SubsetRandomSampler(list(range(50000, 60000)))
     test_set = datasets.MNIST('datasets/dynamic_mnist', train=False, transform=transforms.Compose([
         transforms.ToTensor(),
-        Binarize()
+        Binarize(),
+        Flatten()
     ]))
     train_loader = DataLoader(train_set, batch_size=bs, sampler=train_sampler, **kwargs)
+    mean_obs = 0.0
+    for img, _ in train_loader:
+        mean_obs += img.sum(0)
+    mean_obs /= len(train_loader.dataset)
     val_loader = DataLoader(train_set, batch_size=test_bs, sampler=val_sampler, **kwargs)
     test_loader = DataLoader(test_set, batch_size=test_bs, shuffle=True, **kwargs)
 
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, mean_obs
 
 
 def load_omniglot(bs, test_bs, **kwargs):

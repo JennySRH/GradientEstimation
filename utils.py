@@ -29,6 +29,10 @@ class NonlinearInferenceNet(Module):
         h.append(x)
         return logits, h
 
+    def manual_forward(self, z, starting_layer):
+        logits = []
+        samples_z = []
+        return logits, samples_z
 
 class NonlinearGenerativeNet(Module):
     def __init__(self, dim_observed, dim_latent):
@@ -136,11 +140,11 @@ class GenerativeNet(Module):
             self.add_module(str(idx), module)
 
     def forward(self, x):
-        list = []
+        logits = []
         for idx, module in enumerate(self._modules.values()):
             logit = module(2 * x[idx] - 1.)
-            list.append(logit)
-        return list
+            logits.append(logit)
+        return logits
 
 
 class MultiOptim(object):

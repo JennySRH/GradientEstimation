@@ -99,6 +99,8 @@ class SigmoidBeliefNetwork(nn.Module):
                 self.train_step = self.train_arm
             elif method == 'rebar':
                 self.train_step = self.train_rebar
+            elif method == 'reinforce-loo':
+                self.train_step = self.train_reinforce_loo
             elif method == 'st':
                 self.train_step = self.train_st
                 self.eval_step = self.eval_st
@@ -134,10 +136,11 @@ class SigmoidBeliefNetwork(nn.Module):
         # logit of [z_L , z_{L-1} , ...,  z_1, x] for prior
         logits_p_x_z = [self.top_prior(samples_z[-1])] + self.generative_net(samples_z[::-1] + [x])  
 
+        log_p_x_z.append(log_bernoulli_prob(logits_p_x_z[-1], x))  # log likelihood 
         for i in range(self.num_layers):
             log_p_x_z.append(log_bernoulli_prob(logits_p_x_z[-(i + 2)], samples_z[i]))
             log_q_z.append(log_bernoulli_prob(logits_q_z[i], samples_z[i]))
-        log_p_x_z.append(log_bernoulli_prob(logits_p_x_z[-1], x))  # log likelihood 
+
         return log_p_x_z, log_q_z, (samples_z, logits_p_x_z, logits_q_z)
 
     def compute_multisample_bound(self, x, num_samples=None):
@@ -163,9 +166,10 @@ class SigmoidBeliefNetwork(nn.Module):
         log_q_z = torch.sum(torch.stack(log_q_z, dim=2), dim=2)
         ls = log_p_x_z - log_q_z  # [bs, num_samples]
         elbo = torch.logsumexp(ls, dim=1, keepdim=True)
-        baselines = self._vimco_compute_baseline(ls)
-        ws = (ls - elbo).exp().detach()  # [bs, num_samples]
-        learning_signal = (elbo - baselines).detach()  # [bs, num_samples]
+        with torch.no_grad():
+            baselines = self._vimco_compute_baseline(ls)
+            ws = (ls - elbo).exp()  # [bs, num_samples]
+            learning_signal = elbo - baselines  # [bs, num_samples]
         loss_for_theta = (ws * log_p_x_z).sum(dim=1).mean().neg()
         loss_for_phi = (learning_signal * log_q_z - ws * log_q_z).sum(dim=1).mean().neg()
         total_loss = loss_for_theta + loss_for_phi
@@ -182,7 +186,6 @@ class SigmoidBeliefNetwork(nn.Module):
         log_p_x_z, log_q_z = torch.stack(log_p_x_z, dim=1), torch.stack(log_q_z, dim=1)
         idb_inputs = [(x - self.mean_obs + 1.) / 2] + samples_z
         idbs = self._nvil_compute_idbs(idb_inputs)
-
         with torch.no_grad():
             ls_per_layer = (torch.matmul(self.tri_1, log_p_x_z.unsqueeze(2)) -
                 torch.matmul(self.tri_2, log_q_z.unsqueeze(2))).squeeze(dim=2)
@@ -243,7 +246,7 @@ class SigmoidBeliefNetwork(nn.Module):
                                     dim=-1).mean().neg()
         return total_loss, elbo
 
-    def _arm_mutate_layers(self, x, z, layer, samples_z, logits_q_z):
+    def _forward_from_middle_layers(self, x, z, layer, samples_z, logits_q_z):
         # pass the binary vector at layer t 
         # and return all logits and samples at i-th layer, for all i > t.
         logits_q_gt_t, samples_z_gt_t = self.inference_net.manual_forward(z, layer + 1)
@@ -255,7 +258,7 @@ class SigmoidBeliefNetwork(nn.Module):
         # compute elbo
         log_p_x_z, log_q_z, _ = self.compute_forward(x, samples_z, logits_q)
         elbo = torch.sum(torch.stack(log_p_x_z, dim=1), dim=1) - torch.sum(torch.stack(log_q_z, dim=1), dim=1)
-        return elbo.unsqueeze(1)
+        return elbo
         
     def train_arm(self, x):
         # list with order [z_1, z_2, ..., z_L]
@@ -271,13 +274,59 @@ class SigmoidBeliefNetwork(nn.Module):
                 prob = torch.sigmoid(logits_q_z[layer])
                 z_1 = (u > (1. - prob)).float()
                 z_2 = (u < prob).float()
-                f_1 = self._arm_mutate_layers(x, z_1, layer, samples_z, logits_q_z)
-                f_2 = self._arm_mutate_layers(x, z_2, layer, samples_z, logits_q_z)
+                f_1 = self._forward_from_middle_layers(x, z_1, layer, samples_z, logits_q_z).unsqueeze(1)
+                f_2 = self._forward_from_middle_layers(x, z_2, layer, samples_z, logits_q_z).unsqueeze(1)
             loss_for_theta += torch.sum((f_1 - f_2) * (u - 0.5) * logits_q_z[layer], dim=-1)
         
         total_loss = (log_p_x_z + loss_for_theta).mean().neg()
         return total_loss, elbo
 
+    def train_disarm(self, x):
+        # list with order [z_1, z_2, ..., z_L]
+        log_p_x_z, log_q_z, (samples_z, logits_p_x_z, logits_q_z) = self.compute_forward(x)
+        log_p_x_z = torch.sum(torch.stack(log_p_x_z, dim=1),dim=1)
+        log_q_z = torch.sum(torch.stack(log_q_z, dim=1),dim=1)
+        loss_for_theta = 0.0
+        with torch.no_grad():
+            elbo = (log_p_x_z - log_q_z).mean().neg().item()
+        for layer in range(self.num_layers):
+            with torch.no_grad():
+                u = torch.rand_like(logits_q_z[layer])
+                prob = torch.sigmoid(logits_q_z[layer])
+                abs_prob = torch.sigmoid(torch.abs(logits_q_z[layer]))
+                z_1 = (u > (1. - prob)).float()
+                z_2 = (u < prob).float()
+                f_1 = self._forward_from_middle_layers(x, z_1, layer, samples_z, logits_q_z).unsqueeze(1)
+                f_2 = self._forward_from_middle_layers(x, z_2, layer, samples_z, logits_q_z).unsqueeze(1)
+                learning_signal = 0.5 * (f1 - f2) * (torch.square(z_1 - z_2)) * (-1.)**z_2 * abs_prob
+            loss_for_theta += torch.sum(learning_signal * logits_q_z[layer], dim=-1)
+        
+        total_loss = (log_p_x_z + loss_for_theta).mean().neg()
+        return total_loss, elbo
+
+    def train_reinforce_loo(self, x):
+        # list with order [z_1, z_2, ..., z_L]
+        log_p_x_z, log_q_z, (samples_z, logits_p_x_z, logits_q_z) = self.compute_forward(x)
+        log_p_x_z = torch.sum(torch.stack(log_p_x_z, dim=1),dim=1)
+        log_q_z = torch.sum(torch.stack(log_q_z, dim=1),dim=1)
+        loss_for_theta = 0.0
+        with torch.no_grad():
+            elbo = (log_p_x_z - log_q_z).mean().neg().item()
+        for layer in range(self.num_layers):
+            with torch.no_grad():
+                u_1 = torch.rand_like(logits_q_z[layer])
+                u_2 = torch.rand_like(logits_q_z[layer])
+                prob = torch.sigmoid(logits_q_z[layer])
+                z_1 = (u_1 < prob).float()
+                z_2 = (u_2 < prob).float()
+                f_1 = self._forward_from_middle_layers(x, z_1, layer, samples_z, logits_q_z)
+                f_2 = self._forward_from_middle_layers(x, z_2, layer, samples_z, logits_q_z)
+            log_q_z_1 = log_bernoulli_prob(logits_q_z[layer], z_1)
+            log_q_z_2 = log_bernoulli_prob(logits_q_z[layer], z_2)
+            loss_for_theta += 0.5 * (f_1 - f_2) * log_q_z_1 + 0.5 * (f_2 - f_1) * log_q_z_2
+        
+        total_loss = (log_p_x_z + loss_for_theta).mean().neg()
+        return total_loss, elbo
     def _reparam_z_z_tilde(self, logit, eps=1e-6):
         # adapted from https://github.com/duvenaud/relax/blob/master/rebar_tf.py
         # noise for generating z
