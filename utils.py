@@ -29,10 +29,28 @@ class NonlinearInferenceNet(Module):
         h.append(x)
         return logits, h
 
-    def manual_forward(self, z, starting_layer):
+    def manually_forward(self, x, starting_layer=None, reuse_u=False, global_u=None):
         logits = []
         samples_z = []
-        return logits, samples_z
+        if reuse_u:
+            U = global_u
+        else:
+            U = []
+        if starting_layer is not None:
+            return logits, samples_z, U
+
+        h1 = self.lrelu(self.enc_fc1(2 * x - 1.))
+        h2 = self.lrelu(self.enc_fc2(h1))
+        logit = self.enc_fc3(h2)
+        if reuse_u:
+            u = U[idx]
+        else:
+            u = torch.rand_like(logit)
+            U.append(u) 
+        x = (torch.sigmoid(logit) > u).float()
+        logits.append(logit)
+        samples_z.append(x)
+        return logits, samples_z, U
 
 class NonlinearGenerativeNet(Module):
     def __init__(self, dim_observed, dim_latent):
@@ -104,19 +122,29 @@ class InferenceNet(Module):
             samples_z.append(x)
         return logits, samples_z
 
-    def manual_forward(self, z, starting_layer):
+    def manually_forward(self, x, starting_layer=None, reuse_u=False, global_u=None):
         logits = []
         samples_z = []
+        if reuse_u:
+            U = global_u
+        else:
+            U = []
         for idx, module in enumerate(self._modules.values()):
-            if idx < starting_layer:
+            if starting_layer is not None and idx < starting_layer:
                 continue
-            logit = module(2 * z - 1.)
-            u = torch.rand_like(logit)
-            z = (torch.sigmoid(logit) > u).float()
+            logit = module(2 * x - 1.)
+            if reuse_u:
+                u = U[idx]
+            else:
+                u = torch.rand_like(logit)
+                U.append(u) 
+            # print(logit.shape)
+            # print(u.shape)
+            x = (torch.sigmoid(logit) > u).float()
             logits.append(logit)
-            samples_z.append(z)
-        return logits, samples_z
-
+            samples_z.append(x)
+            
+        return logits, samples_z, U
 
 
 class AutoRegressiveGenerativeNet(Module):

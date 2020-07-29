@@ -125,9 +125,9 @@ def load_caltech101silhouettes(bs, test_bs, **kwargs):
 
 
 def load_dataset(args):
-    if args.dataset == 'dynamic_mnist':
+    if args.dataset == 'dynamic-mnist':
         return load_dynamic_mnist(args.batch_size, args.test_batch_size)
-    elif args.dataset == 'static_mnist':
+    elif args.dataset == 'static-mnist':
         return load_static_mnist(args.batch_size, args.test_batch_size)
     elif args.dataset == 'omniglot':
         return load_omniglot(args.batch_size, args.test_batch_size)

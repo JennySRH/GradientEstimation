@@ -92,11 +92,12 @@ class SigmoidBeliefNetwork(nn.Module):
             if method == 'vimco':
                 self.train_step = self.train_vimco
                 self.eval_step = self.compute_multisample_bound
-            elif method == 'legrad':
-                print('LeGrad algorithm only supports SBN with single hidden layer')
-                self.train_step = self.train_legrad
             elif method == 'arm':
                 self.train_step = self.train_arm
+            elif method == 'disarm':
+                self.train_step = self.train_disarm
+            elif method == 'ram':
+                self.train_step = self.train_ram
             elif method == 'rebar':
                 self.train_step = self.train_rebar
             elif method == 'reinforce-loo':
@@ -204,52 +205,103 @@ class SigmoidBeliefNetwork(nn.Module):
         total_loss = loss_for_theta + loss_for_phi + loss_for_psi
         return total_loss, elbo.mean().neg().item()
 
-    def _compute_flipped_f(self, x, logit_q, sampled_h):
-        p_xh_0 = []
-        p_xh_1 = []
-        q_h_0 = []
-        q_h_1 = []
-        for i in range(self.num_layers):
-            dim = sampled_h[i].shape[-1]
-            cur_h = sampled_h[i].unsqueeze(dim=1).repeat(1, dim, 1)
-            cur_h.diagonal(dim1=-2, dim2=-1).copy_(torch.zeros(dim))
-            logit_px_h = self.generative_net([cur_h, x])
-            logit_p = self.top_prior(cur_h)
-            p_xh_0 = log_bernoulli_prob(logit_p.unsqueeze(dim=1), cur_h) + \
-                     log_bernoulli_prob(logit_px_h[-1], x)
-            q_h_0 = log_bernoulli_prob(logit_q[i].unsqueeze(dim=1), cur_h)
-
-            cur_h.diagonal(dim1=-2, dim2=-1).copy_(torch.ones(dim))
-            logit_px_h = self.generative_net([cur_h, x])
-            logit_p = self.top_prior(cur_h)
-            p_xh_1 = log_bernoulli_prob(logit_p.unsqueeze(dim=1), cur_h) + \
-                     log_bernoulli_prob(logit_px_h[-1], x)
-            q_h_1 = log_bernoulli_prob(logit_q[i].unsqueeze(dim=1), cur_h)
-        return p_xh_0, q_h_0, p_xh_1, q_h_1
-
-    def train_legrad(self, x):
-        logit_q, sampled_h = self.inference_net((x - self.mean_obs + 1.) / 2)
-        # logit of [h_1 , h_2 , ... , h_n] for posterior
-        logit_p_x_h = self.generative_net(sampled_h[::-1] + [x])  # logit of h_n-1, h_n-2, ..., h_1, x
-        logit_p = [self.top_prior(sampled_h[-1])] + logit_p_x_h[:-1]
-        log_ll = log_bernoulli_prob(logit_p_x_h[-1], x).unsqueeze(dim=1)  # log likelihood
-        log_qh_x = log_bernoulli_prob(logit_q[0], sampled_h[0]).unsqueeze(dim=1)
-        log_ph = log_bernoulli_prob(logit_p[-1], sampled_h[0]).unsqueeze(dim=1)
+    def _ram_surrogate_phi_loss(self, x, logits_q_z, samples_z, u):
+        x = x.unsqueeze(dim=1)  # [bs, 1, dim]
+        prob_vectors = [torch.sigmoid(logit) for logit in logits_q_z]
+        learning_signals = []
         with torch.no_grad():
-            p_xh_0, q_h_0, p_xh_1, q_h_1 = self._compute_flipped_f(x.unsqueeze(dim=1), logit_q, sampled_h)
-            elbo = (log_ph + log_ll - log_qh_x).squeeze().mean().neg().item()
-        total_loss = (log_ph + log_ll).squeeze().mean().neg()
+            # to make these tensor lists compatible with broadcasting
+            u = [noise.unsqueeze(dim=1) for noise in u]
+            logits_q_z = [logit.unsqueeze(dim=1) for logit in logits_q_z]
+            prev_z = [sample.unsqueeze(dim=1) for sample in samples_z]
 
+            for layer in range(self.num_layers):
+                # repeat the l-th layer logits dim times on 2-nd dim,
+                # resulting in a [bs, dim, dim] tensor.
+                # for each data point, the resulting tensor has structure
+                # [[ ---- {z_l}^T ------- ],
+                #  [ ---- {z_l}^T ------- ],
+                #          .....
+                #  [ ---- {z_l}^T ------- ]]
+                batched_z_l = prev_z[layer].repeat(1, prev_z[layer].shape[-1], 1)
+
+                # set the diagonal elements in logit matrix to 0
+                batched_z_l.diagonal(dim1=-2, dim2=-1).copy_(torch.zeros(batched_z_l.shape[-1]))
+
+                # and return all logits and samples at i-th layer, for all i > l.
+                logits_q_gt_l, samples_z_gt_l, _ = self.inference_net.manually_forward(batched_z_l, layer + 1, reuse_u=True, global_u=u)
+                
+
+                # re-combine all logits and samples 1-{l-1}, l, {l+1}-T
+                samples_z = prev_z[0:layer] + [batched_z_l] + samples_z_gt_l
+                logits_q = logits_q_z[0:layer + 1] + logits_q_gt_l
+                # logits with shape [bs, 1, dim] or [bs, dim, dim] (all broadcastable)
+                # print("start")
+                # for logit in logits_q:
+                #     print(logit.shape)
+                # for sample in samples_z:
+                #     print(sample.shape)
+                # compute elbo
+                # logit of [z_L , z_{L-1} , ...,  z_1, x] for prior
+                # with shape [bs, dim, dim]
+                log_p_x_z = 0.0
+                log_q_z = 0.0
+                logits_p_x_z = [self.top_prior(samples_z[-1])] + self.generative_net(samples_z[::-1] + [x])  
+                for i in range(self.num_layers):
+                    log_p_x_z = log_p_x_z + log_bernoulli_prob(logits_p_x_z[-(i + 2)], samples_z[i])
+                    log_q_z = log_q_z + log_bernoulli_prob(logits_q_z[i], samples_z[i])
+                log_p_x_z = log_p_x_z + log_bernoulli_prob(logits_p_x_z[-1], x)  # log likelihood, with shape [bs, dim]
+
+                batch_elbo_0 = log_p_x_z - log_q_z  # [bs, dim]
+
+
+                # set the diagonal elements in logit matrix to 1
+                batched_z_l.diagonal(dim1=-2, dim2=-1).copy_(torch.ones(batched_z_l.shape[-1]))
+                # and return all logits and samples at i-th layer, for all i > l.
+                logits_q_gt_l, samples_z_gt_l, _ = self.inference_net.manually_forward(batched_z_l, layer + 1, reuse_u=True, global_u=u)
+                
+                # re-combine all logits and samples 1-{l-1}, l, {l+1}-T
+                samples_z = prev_z[0:layer] + [batched_z_l] + samples_z_gt_l
+                logits_q = logits_q_z[0:layer + 1] + logits_q_gt_l
+
+                # compute elbo
+                # logit of [z_L , z_{L-1} , ...,  z_1, x] for prior
+                # with shape [bs, dim, dim]
+                log_p_x_z = 0.0
+                log_q_z = 0.0
+                logits_p_x_z = [self.top_prior(samples_z[-1])] + self.generative_net(samples_z[::-1] + [x])  
+                for i in range(self.num_layers):
+                    log_p_x_z = log_p_x_z + log_bernoulli_prob(logits_p_x_z[-(i + 2)], samples_z[i])
+                    log_q_z = log_q_z + log_bernoulli_prob(logits_q_z[i], samples_z[i])
+                log_p_x_z = log_p_x_z + log_bernoulli_prob(logits_p_x_z[-1], x)  # log likelihood, with shape [bs, dim]
+                batch_elbo_1 = log_p_x_z - log_q_z  # [bs, dim]
+                learning_signals.append(batch_elbo_1 - batch_elbo_0)
+
+        surrogate_loss = 0.
+        for layer in range(self.num_layers):
+            surrogate_loss += torch.sum(learning_signals[layer] * prob_vectors[layer], dim=-1)
+        return surrogate_loss.mean().neg()
+
+    def train_ram(self, x):
+        logits_q_z, samples_z, U = self.inference_net.manually_forward((x - self.mean_obs + 1.) / 2)
+        logits_p_x_z = [self.top_prior(samples_z[-1])] + self.generative_net(samples_z[::-1] + [x])  
+        log_p_x_z = 0
+        log_q_z = 0
+        log_p_x_z += log_bernoulli_prob(logits_p_x_z[-1], x)  # log likelihood 
         for i in range(self.num_layers):
-            total_loss += torch.sum(torch.sigmoid(logit_q[i]) * (p_xh_1 - q_h_1) +
-                                    torch.sigmoid(-logit_q[i]) * (p_xh_0 - q_h_0),
-                                    dim=-1).mean().neg()
+            log_p_x_z += log_bernoulli_prob(logits_p_x_z[-(i + 2)], samples_z[i])
+            log_q_z += log_bernoulli_prob(logits_q_z[i], samples_z[i])
+
+        with torch.no_grad():
+            elbo = (log_p_x_z - log_q_z).squeeze().mean().neg().item()
+        total_loss = log_p_x_z.mean().neg()
+        total_loss += self._ram_surrogate_phi_loss(x, logits_q_z, samples_z, U)
         return total_loss, elbo
 
     def _forward_from_middle_layers(self, x, z, layer, samples_z, logits_q_z):
         # pass the binary vector at layer t 
         # and return all logits and samples at i-th layer, for all i > t.
-        logits_q_gt_t, samples_z_gt_t = self.inference_net.manual_forward(z, layer + 1)
+        logits_q_gt_t, samples_z_gt_t, _ = self.inference_net.manually_forward(z, layer + 1)
 
         # re-combine all logits and samples 1-{t-1}, t, {t+1}-T
         samples_z = samples_z[0:layer] + [z] + samples_z_gt_t
@@ -298,7 +350,7 @@ class SigmoidBeliefNetwork(nn.Module):
                 z_2 = (u < prob).float()
                 f_1 = self._forward_from_middle_layers(x, z_1, layer, samples_z, logits_q_z).unsqueeze(1)
                 f_2 = self._forward_from_middle_layers(x, z_2, layer, samples_z, logits_q_z).unsqueeze(1)
-                learning_signal = 0.5 * (f1 - f2) * (torch.square(z_1 - z_2)) * (-1.)**z_2 * abs_prob
+                learning_signal = 0.5 * (f_1 - f_2) * ((z_1 - z_2) ** 2) * ((-1.)**z_2) * abs_prob
             loss_for_theta += torch.sum(learning_signal * logits_q_z[layer], dim=-1)
         
         total_loss = (log_p_x_z + loss_for_theta).mean().neg()
