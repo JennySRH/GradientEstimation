@@ -9,6 +9,19 @@ from torch.nn import init
 from torch.nn.functional import softplus, softmax
 
 
+class InputDependentBaseline(Module):
+    def __init__(self, input_dim, aux_net_dim=100):
+        super(InputDependentBaseline, self).__init__()
+        self.fnn = nn.Sequential(
+            nn.Linear(input_dim, aux_net_dim),
+            nn.Tanh(),
+            nn.Linear(aux_net_dim, 1)
+        )
+
+    def forward(self, x):
+        return self.fnn(2 * x - 1.)
+
+
 class NonlinearInferenceNet(Module):
     def __init__(self, dim_observed, dim_latent):
         super(NonlinearInferenceNet, self).__init__()
@@ -51,36 +64,6 @@ class NonlinearInferenceNet(Module):
         logits.append(logit)
         samples_z.append(x)
         return logits, samples_z, U
-
-class NonlinearGenerativeNet(Module):
-    def __init__(self, dim_observed, dim_latent):
-        super(NonlinearGenerativeNet, self).__init__()
-        self.lrelu = nn.LeakyReLU(0.3)
-        self.dec_fc1 = nn.Linear(dim_latent, dim_latent)
-        self.dec_fc2 = nn.Linear(dim_latent, dim_latent)
-        self.dec_fc3 = nn.Linear(dim_latent, dim_observed)
-
-    def forward(self, x):
-        logits = []
-        h1 = self.lrelu(self.dec_fc1(2 * x[0] - 1.))
-        h2 = self.lrelu(self.dec_fc2(h1))
-        logit = self.dec_fc3(h2)
-        logits.append(logit)
-        return logits
-
-
-class InputDependentBaseline(Module):
-    def __init__(self, input_dim, aux_net_dim=100):
-        super(InputDependentBaseline, self).__init__()
-        self.fnn = nn.Sequential(
-            nn.Linear(input_dim, aux_net_dim),
-            nn.Tanh(),
-            nn.Linear(aux_net_dim, 1)
-        )
-
-    def forward(self, x):
-        return self.fnn(2 * x - 1.)
-
 
 class AutoRegressiveInferenceNet(Module):
     def __init__(self, *args):
@@ -147,12 +130,35 @@ class InferenceNet(Module):
         return logits, samples_z, U
 
 
+
+class NonlinearGenerativeNet(Module):
+    def __init__(self, dim_observed, dim_latent, bias_init=None):
+        super(NonlinearGenerativeNet, self).__init__()
+        self.lrelu = nn.LeakyReLU(0.3)
+        self.dec_fc1 = nn.Linear(dim_latent, dim_latent)
+        self.dec_fc2 = nn.Linear(dim_latent, dim_latent)
+        self.dec_fc3 = nn.Linear(dim_latent, dim_observed)
+        if bias_init is not None:
+            with torch.no_grad():
+                self.dec_fc3.bias = nn.Parameter(bias_init)
+
+    def forward(self, x):
+        logits = []
+        h1 = self.lrelu(self.dec_fc1(2 * x[0] - 1.))
+        h2 = self.lrelu(self.dec_fc2(h1))
+        logit = self.dec_fc3(h2)
+        logits.append(logit)
+        return logits
+
 class AutoRegressiveGenerativeNet(Module):
-    def __init__(self, *args):
+    def __init__(self, *args, bias_init=None):
         super(AutoRegressiveGenerativeNet, self).__init__()
         for idx, module in enumerate(args):
+            if idx == len(args) - 1 and bias_init is not None:
+                with torch.no_grad():
+                    module.bias = nn.Parameter(bias_init)
             self.add_module(str(idx), module)
-
+            
     def forward(self, x):
         list = []
         for idx, module in enumerate(self._modules.values()):
@@ -162,9 +168,12 @@ class AutoRegressiveGenerativeNet(Module):
 
 
 class GenerativeNet(Module):
-    def __init__(self, *args):
+    def __init__(self, *args, bias_init=None):
         super(GenerativeNet, self).__init__()
         for idx, module in enumerate(args):
+            if idx == len(args) - 1 and bias_init is not None:
+                with torch.no_grad():
+                    module.bias = nn.Parameter(bias_init)
             self.add_module(str(idx), module)
 
     def forward(self, x):
@@ -366,11 +375,14 @@ class MaskedLinear(Module):
 
 
 class Bias(Module):
-    def __init__(self, dim, trainable=True):
+    def __init__(self, dim, trainable=True, init_tensor=None):
         super(Bias, self).__init__()
         if trainable:
-            self.bias = nn.Parameter(torch.Tensor(1, dim))
-            self.reset_parameters()
+            if init_tensor is not None:
+                self.bias = nn.Parameter(init_tensor)
+            else:
+                self.bias = nn.Parameter(torch.Tensor(1, dim))
+                self.reset_parameters()
         else:
             self.register_buffer('bias', torch.zeros(1, dim))
 
@@ -380,48 +392,3 @@ class Bias(Module):
 
     def forward(self, input):
         return self.bias
-
-# def _compute_flipped_f(self, logit_p, logit_q, sampled_h):
-#     p_xh_0 = []
-#     p_xh_1 = []
-#     q_h_0 = []
-#     q_h_1 = []
-#     for i in range(self.num_layers):
-#         dim = sampled_h[i].shape[-1]
-#         cur_h = sampled_h[i].unsqueeze(dim=1).repeat(1, dim, 1)
-#         cur_h.diagonal(dim1=-2, dim2=-1).copy_(torch.zeros(dim))
-#         p_xh_0.append(log_bernoulli_prob(logit_p[-(i + 1)].unsqueeze(dim=1), cur_h))
-#         q_h_0.append(log_bernoulli_prob(logit_q[i].unsqueeze(dim=1), cur_h))
-#         cur_h.diagonal(dim1=-2, dim2=-1).copy_(torch.ones(dim))
-#         p_xh_1.append(log_bernoulli_prob(logit_p[-(i + 1)].unsqueeze(dim=1), cur_h))
-#         q_h_1.append(log_bernoulli_prob(logit_q[i].unsqueeze(dim=1), cur_h))
-#     return p_xh_0, q_h_0, p_xh_1, q_h_1
-# def train_legrad(self, x):
-#     log_prior = []  # p(h_1 | h_2), p(h_2 | h_3), ..., p(h_n)
-#     log_posterior = []  # q(h_1 | x), q(h_2 | h_1), q(h_3 | h_2) ..., q(h_n | h_n-1)
-#     logit_q, sampled_h = self.inference_net((x - self.mean_obs + 1.) / 2)
-#     # logit of [h_1 , h_2 , ... , h_n] for posterior
-#     logit_p_x_h = self.generative_net(sampled_h[::-1] + [x])  # logit of h_n-1, h_n-2, ..., h_1, x
-#     logit_p = [self.top_prior(sampled_h[-1])] + logit_p_x_h[:-1]
-#     log_ll = log_bernoulli_prob(logit_p_x_h[-1], x).unsqueeze(dim=1)  # log likelihood
-#     log_qh_x = 0.
-#     log_ph = 0.
-#     for i in range(self.num_layers):
-#         log_prior.append(log_bernoulli_prob(logit_p[-(i + 1)], sampled_h[i]).unsqueeze(dim=1))
-#         log_posterior.append(log_bernoulli_prob(logit_q[i], sampled_h[i]).unsqueeze(dim=1))
-#         log_qh_x += log_posterior[-1]
-#         log_ph += log_prior[-1]
-#     with torch.no_grad():
-#         p_xh_0, q_h_0, p_xh_1, q_h_1 = self._compute_flipped_f(logit_p, logit_q, sampled_h)
-#         elbo = (log_ph + log_ll - log_qh_x).squeeze().mean().neg().item()
-#     total_loss = (log_ph + log_ll).squeeze().mean().neg()
-#
-#     for i in range(self.num_layers):
-#         clamped0_logp = log_ph.detach() - log_prior[i].detach() + p_xh_0[i]
-#         clamped1_logp = log_ph.detach() - log_prior[i].detach() + p_xh_1[i]
-#         clamped0_logq = log_qh_x.detach() - log_posterior[i].detach() + q_h_0[i]
-#         clamped1_logq = log_qh_x.detach() - log_posterior[i].detach() + q_h_1[i]
-#         total_loss += torch.sum(torch.sigmoid(logit_q[i]) * (clamped1_logp + log_ll.detach() - clamped1_logq) +
-#                                 torch.sigmoid(-logit_q[i]) * (clamped0_logp + log_ll.detach() - clamped0_logq),
-#                                 dim=-1).mean().neg()
-#     return total_loss, elbo

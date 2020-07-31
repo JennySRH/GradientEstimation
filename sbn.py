@@ -11,6 +11,7 @@ from utils import GenerativeNet, InferenceNet, InputDependentBaseline, AutoRegre
 class SigmoidBeliefNetwork(nn.Module):
     def __init__(self,
                  mean_obs,
+                 output_bias_init,
                  dim_hids=[200],
                  dim_obs=784,
                  use_nonlinear=False,
@@ -30,16 +31,15 @@ class SigmoidBeliefNetwork(nn.Module):
         # x -> z_1 -> z_2 -> ... -> z_L
         if use_nonlinear:
             self.top_prior = Bias(gen_layers[0], trainable=use_uniform_prior)
-            self.generative_net = NonlinearGenerativeNet(dim_obs, dim_hids[0])
+            self.generative_net = NonlinearGenerativeNet(dim_obs, dim_hids[0], bias_init=output_bias_init)
             self.inference_net = NonlinearInferenceNet(dim_obs, dim_hids[0])
         else:
             if use_ar_gen and use_ar_inf:
                 self.top_prior = MaskedLinear(torch.triu(torch.ones(gen_layers[0], gen_layers[0]), diagonal=1))
                 self.generative_net = AutoRegressiveGenerativeNet(
                     *[nn.ModuleList([nn.Linear(gen_layers[i], gen_layers[i + 1]),
-                                     MaskedLinear(
-                                         torch.triu(torch.ones(gen_layers[i + 1], gen_layers[i + 1]), diagonal=1),
-                                         bias=False)]) for i in range(len(gen_layers) - 1)])
+                                     MaskedLinear(torch.triu(torch.ones(gen_layers[i + 1], gen_layers[i + 1]), diagonal=1),
+                                         bias=False)]) for i in range(len(gen_layers) - 1)], bias_init=output_bias_init)
                 self.inference_net = AutoRegressiveInferenceNet(
                     *[nn.ModuleList([nn.Linear(inf_layers[i], inf_layers[i + 1]),
                                      MaskedLinear(
@@ -47,8 +47,8 @@ class SigmoidBeliefNetwork(nn.Module):
                                          bias=False)]) for i in range(len(inf_layers) - 1)])
             elif not use_ar_gen and use_ar_inf:
                 self.top_prior = Bias(gen_layers[0])
-                self.generative_net = GenerativeNet(
-                    *[nn.Linear(gen_layers[i], gen_layers[i + 1]) for i in range(len(gen_layers) - 1)])
+                self.generative_net = GenerativeNet(*[nn.Linear(gen_layers[i], gen_layers[i + 1]) for i in range(len(gen_layers) - 1)], 
+                                                    bias_init=output_bias_init)
                 self.inference_net = AutoRegressiveInferenceNet(
                     *[nn.ModuleList([nn.Linear(inf_layers[i], inf_layers[i + 1]),
                                      MaskedLinear(
@@ -58,15 +58,14 @@ class SigmoidBeliefNetwork(nn.Module):
                 self.top_prior = MaskedLinear(torch.triu(torch.ones(gen_layers[0], gen_layers[0]), diagonal=1))
                 self.generative_net = AutoRegressiveGenerativeNet(
                     *[nn.ModuleList([nn.Linear(gen_layers[i], gen_layers[i + 1]),
-                                     MaskedLinear(
-                                         torch.triu(torch.ones(gen_layers[i + 1], gen_layers[i + 1]), diagonal=1),
-                                         bias=False)]) for i in range(len(gen_layers) - 1)])
+                                     MaskedLinear(torch.triu(torch.ones(gen_layers[i + 1], gen_layers[i + 1]), diagonal=1),
+                                         bias=False)]) for i in range(len(gen_layers) - 1)], bias_init=output_bias_init)
                 self.inference_net = InferenceNet(
                     *[nn.Linear(inf_layers[i], inf_layers[i + 1]) for i in range(len(inf_layers) - 1)])
             elif not use_ar_gen and not use_ar_inf:
                 self.top_prior = Bias(gen_layers[0])
-                self.generative_net = GenerativeNet(
-                    *[nn.Linear(gen_layers[i], gen_layers[i + 1]) for i in range(len(gen_layers) - 1)])
+                self.generative_net = GenerativeNet(*[nn.Linear(gen_layers[i], gen_layers[i + 1]) for i in range(len(gen_layers) - 1)], 
+                                                    bias_init=output_bias_init)
                 self.inference_net = InferenceNet(
                     *[nn.Linear(inf_layers[i], inf_layers[i + 1]) for i in range(len(inf_layers) - 1)])
 
@@ -83,12 +82,6 @@ class SigmoidBeliefNetwork(nn.Module):
             self.register_buffer('all_ones', torch.ones(self.num_layers))
             self.train_step = self.train_nvil
         else:
-            # self.register_parameter('idb', None)
-            # self.register_parameter('all_ones', None)
-            # self.register_parameter('tri_2', None)
-            # self.register_parameter('tri_1', None)
-            # self.register_parameter('running_mean', None)
-            # self.register_parameter('running_var', None)
             if method == 'vimco':
                 self.train_step = self.train_vimco
                 self.eval_step = self.compute_multisample_bound
