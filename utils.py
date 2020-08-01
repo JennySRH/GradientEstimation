@@ -375,14 +375,11 @@ class MaskedLinear(Module):
 
 
 class Bias(Module):
-    def __init__(self, dim, trainable=True, init_tensor=None):
+    def __init__(self, dim, trainable=True):
         super(Bias, self).__init__()
         if trainable:
-            if init_tensor is not None:
-                self.bias = nn.Parameter(init_tensor)
-            else:
-                self.bias = nn.Parameter(torch.Tensor(1, dim))
-                self.reset_parameters()
+            self.bias = nn.Parameter(torch.Tensor(1, dim))
+            self.reset_parameters()
         else:
             self.register_buffer('bias', torch.zeros(1, dim))
 

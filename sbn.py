@@ -30,7 +30,7 @@ class SigmoidBeliefNetwork(nn.Module):
         # z_L -> z_{L-1} -> ... -> z_1 -> x
         # x -> z_1 -> z_2 -> ... -> z_L
         if use_nonlinear:
-            self.top_prior = Bias(gen_layers[0], trainable=use_uniform_prior)
+            self.top_prior = Bias(gen_layers[0], trainable=(not use_uniform_prior))
             self.generative_net = NonlinearGenerativeNet(dim_obs, dim_hids[0], bias_init=output_bias_init)
             self.inference_net = NonlinearInferenceNet(dim_obs, dim_hids[0])
         else:
@@ -46,7 +46,7 @@ class SigmoidBeliefNetwork(nn.Module):
                                          torch.triu(torch.ones(inf_layers[i + 1], inf_layers[i + 1]), diagonal=1),
                                          bias=False)]) for i in range(len(inf_layers) - 1)])
             elif not use_ar_gen and use_ar_inf:
-                self.top_prior = Bias(gen_layers[0])
+                self.top_prior = Bias(gen_layers[0], trainable=(not use_uniform_prior))
                 self.generative_net = GenerativeNet(*[nn.Linear(gen_layers[i], gen_layers[i + 1]) for i in range(len(gen_layers) - 1)], 
                                                     bias_init=output_bias_init)
                 self.inference_net = AutoRegressiveInferenceNet(
@@ -63,7 +63,7 @@ class SigmoidBeliefNetwork(nn.Module):
                 self.inference_net = InferenceNet(
                     *[nn.Linear(inf_layers[i], inf_layers[i + 1]) for i in range(len(inf_layers) - 1)])
             elif not use_ar_gen and not use_ar_inf:
-                self.top_prior = Bias(gen_layers[0])
+                self.top_prior = Bias(gen_layers[0], trainable=(not use_uniform_prior))
                 self.generative_net = GenerativeNet(*[nn.Linear(gen_layers[i], gen_layers[i + 1]) for i in range(len(gen_layers) - 1)], 
                                                     bias_init=output_bias_init)
                 self.inference_net = InferenceNet(

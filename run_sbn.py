@@ -3,9 +3,12 @@ import argparse
 import load_dataset
 from sbn import SigmoidBeliefNetwork
 from torch.optim import Adam, SGD
+from torch.utils.tensorboard import SummaryWriter
 from load_dataset import load_dataset
 from utils import MultiOptim
 import numpy as np
+
+writer = SummaryWriter()
 
 parser = argparse.ArgumentParser(description='Arguments')
 parser.add_argument('--batch-size', type=int, default=50)
@@ -22,11 +25,11 @@ parser.add_argument('-d', '--dataset', type=str, default='static-mnist')
 parser.add_argument('-m', '--model', type=str, default='nvil')
 parser.add_argument('-k', '--num-samples', type=int, default=5)
 parser.add_argument('--test-samples', type=int, default=1000)
-parser.add_argument('--use-output-bias', action='store_true', default=False)
+parser.add_argument('--no-init-bias', action='store_false', default=True)
 parser.add_argument('--use-argen', action='store_true', default=False)
 parser.add_argument('--use-arinf', action='store_true', default=False)
-parser.add_argument('--use-nonlinear', action='store_true', default=False)
-parser.add_argument('--use-uniform', action='store_true', default=False)
+parser.add_argument('--use-nonlinear', action='store_true', default=False, help="gpu number")
+parser.add_argument('--use-uniform', action='store_true', default=False, help="using a not learnable prior or not")
 parser.add_argument("--gpu-num", type=str, default="0", help="gpu number")
 args = parser.parse_args()
 
@@ -84,7 +87,7 @@ def calc_nll(test_loader, model, args):
 
 def run():
     train_loader, val_loader, test_loader, mean_obs = load_dataset(args)
-    if args.use_output_bias:
+    if not args.no_init_bias:
         init_bias = -torch.log(1./torch.clamp(mean_obs, 0.001, 0.999) - 1.)
     else:
         init_bias = None
@@ -105,13 +108,13 @@ def run():
         param_list = list(model.generative_net.parameters()) + list(model.inference_net.parameters()) + list(model.idb.parameters())
     else:
         param_list = list(model.generative_net.parameters()) + list(model.inference_net.parameters())
-    print(param_list)
     # according to https://github.com/mingzhang-yin/ARM-gradient/blob/master/b_omni_linear.py#L192,
     # the top prior parameters p(b_L) are optimized using SGD with learning rate 0.01;
     # and all the other parameters are optimized using Adam with learning rate 0.0001.
     optim_1 = Adam(param_list, lr=args.lr)
     optim_2 = SGD(model.top_prior.parameters(), lr=args.prior_lr)
     optim = MultiOptim(optim_1, optim_2)
+    
     if args.model == 'vimco':
         args.model_config = args.model + '-' + str(args.num_samples)
     else:
@@ -125,6 +128,8 @@ def run():
             args.model_config += '-arinf'
     if args.cuda:
         model.cuda()
+
+    # main running loop
     for epoch in range(args.epochs):
         train_elbo = train_sbn(train_loader, model, optim, args)
         eval_elbo = eval_sbn(test_loader, model, args)

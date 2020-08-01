@@ -143,3 +143,6 @@ datasets/
 
 # vscode setting
 .vscode/
+
+# scripts for visualization
+visualize.py
