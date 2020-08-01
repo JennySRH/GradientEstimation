@@ -91,16 +91,16 @@ class SigmoidBeliefNetwork(nn.Module):
                 self.train_step = self.train_disarm
             elif method == 'ram':
                 self.train_step = self.train_ram
-            elif method == 'rebar':
-                self.train_step = self.train_rebar
+            # elif method == 'rebar':
+                # self.train_step = self.train_rebar
             elif method == 'reinforce-loo':
                 self.train_step = self.train_reinforce_loo
-            elif method == 'st':
-                self.train_step = self.train_st
-                self.eval_step = self.eval_st
-            elif method == 'gumbel':
-                self.train_step = self.train_gumbel
-                self.eval_step = self.eval_gumbel
+            # elif method == 'st':
+            #     self.train_step = self.train_st
+            #     self.eval_step = self.eval_st
+            # elif method == 'gumbel':
+            #     self.train_step = self.train_gumbel
+            #     self.eval_step = self.eval_gumbel
 
     def compute_elbo(self, x, z=None):
         log_p_x_z, log_q_z, _ = self.compute_forward(x, z)

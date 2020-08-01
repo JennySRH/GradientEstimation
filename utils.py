@@ -213,8 +213,8 @@ def gumbel_sigmoid(logits, temperature, hard=True, eps=1e-20):
     u = torch.rand_like(logits)
     logistic_noise = torch.log(u + eps) - torch.log(1 - u + eps)
     y = logits + logistic_noise
-    # sampled = torch.sigmoid(y / temperature)
-    sampled = torch.clamp((y + 1.) / (2. * temperature), 0., 1.)
+    sampled = torch.sigmoid(y / temperature)
+    # sampled = torch.clamp((y + 1.) / (2. * temperature), 0., 1.)
     if not hard:
         return sampled
     hard_samples = (sampled > 0.5).float()
@@ -248,8 +248,8 @@ def gumbel_softmax(logits, temperature, hard=False, eps=1e-20):
 def st_sigmoid(logit, is_logit=True):
     shape = logit.size()
     if is_logit:
-        # prob = torch.sigmoid(logit)
-        prob = torch.clamp((logit + 1.)/2., 0., 1.)
+        prob = torch.sigmoid(logit)
+        # prob = torch.clamp((logit + 1.)/2., 0., 1.)
     else:
         prob = logit
     u = torch.rand_like(prob)
