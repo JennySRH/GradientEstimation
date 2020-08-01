@@ -140,21 +140,21 @@ def run():
         ))
     test_ll = calc_nll(test_loader, model, args)
     print('Test loss : {:.4f}'.format(test_ll))
-    np.save('logs/sbn/{}_train_bs{}_ds{}_layer{}_genlr{}_inflr{}.npy'.format(
+    np.save('logs/sbn/{}_train_bs{}_ds{}_layer{}_lr{}_priorlr{}.npy'.format(
         args.model_config,
         args.batch_size,
         args.dataset,
         '-'.join(str(dim) for dim in args.dims),
-        args.gen_lr,
-        args.inf_lr
+        args.lr,
+        args.prior_lr
     ), np.array(train_elbos))
-    np.save('logs/sbn/{}_test_bs{}_ds{}_layer{}_genlr{}_inflr{}.npy'.format(
+    np.save('logs/sbn/{}_test_bs{}_ds{}_layer{}_lr{}_priorlr{}.npy'.format(
         args.model_config,
         args.batch_size,
         args.dataset,
         '-'.join(str(dim) for dim in args.dims),
-        args.gen_lr,
-        args.inf_lr
+        args.lr,
+        args.prior_lr
     ), np.array(eval_elbos))
     with open('logs/sbn/ex.txt', 'a+') as f:
         f.write('config: {} \ntrain loss : {:.4f}, eval loss : {:.4f}, test ll : {:.4f}\n'.
